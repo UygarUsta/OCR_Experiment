@@ -68,7 +68,7 @@ class ImprovedPlateOCR(nn.Module):
         self.backbone.classifier = nn.Identity()
         
         self.feature_h = 2
-        self.feature_w = 6
+        self.feature_w =  10  #6 192/32
         self.feature_channels = 576
         
         # Channel Attention (SE-like block)
@@ -87,7 +87,7 @@ class ImprovedPlateOCR(nn.Module):
         )
         
         # Bidirectional GRU
-        self.rnn = nn.GRU(
+        self.rnn = nn.LSTM(
             input_size=self.feature_channels,
             hidden_size=256,
             num_layers=2,
@@ -134,6 +134,110 @@ class ImprovedPlateOCR(nn.Module):
         return self.feature_h * self.feature_w
     
 
+
+class MixingBlock(nn.Module):
+    def __init__(self, channels, num_heads, expansion=4, kernel_size=3):
+        super().__init__()
+        self.channels = channels
+        self.num_heads = num_heads
+        
+        # Local mixing (Depthwise Conv)
+        self.local_conv = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size, 
+                     padding=kernel_size//2, groups=channels),
+            nn.BatchNorm2d(channels),
+            nn.GELU()
+        )
+        
+        # Global mixing (Multi-head Attention)
+        self.attention = nn.MultiheadAttention(channels, num_heads, batch_first=True)
+        self.attention_norm = nn.LayerNorm(channels)
+        
+        # Feed-forward network
+        self.ffn = nn.Sequential(
+            nn.Linear(channels, channels * expansion),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(channels * expansion, channels),
+        )
+        self.ffn_norm = nn.LayerNorm(channels)
+
+    def forward(self, x, H, W):
+        B, T, C = x.shape
+        residual = x
+        
+        # Local mixing branch
+        x_2d = x.view(B, H, W, C).permute(0, 3, 1, 2)
+        x_local = self.local_conv(x_2d).permute(0, 2, 3, 1).view(B, T, C)
+        x = residual + x_local
+        
+        # Global mixing branch
+        x = self.attention_norm(x)
+        x_global, _ = self.attention(x, x, x)
+        x = x + x_global
+        
+        # FFN
+        x = self.ffn_norm(x)
+        x = x + self.ffn(x)
+        
+        return x
+
+class ImprovedPlateOCRSVTR(nn.Module):
+    def __init__(self, num_classes):
+        super(ImprovedPlateOCRSVTR, self).__init__()
+        
+        # MobileNetV3-Small backbone
+        self.backbone = models.mobilenet_v3_small(pretrained=True)
+        self.backbone.classifier = nn.Identity()
+        
+        # Feature parameters
+        self.feature_h = 2
+        self.feature_w = 6
+        in_channels = 576
+        
+        # Channel reduction
+        self.channel_reduce = nn.Sequential(
+            nn.Conv2d(in_channels, 256, 1),
+            nn.BatchNorm2d(256),
+            nn.Hardswish(inplace=True))
+        
+        # SVTR Neck
+        self.svtr_neck = nn.ModuleList([
+            MixingBlock(256, num_heads=4),
+            MixingBlock(256, num_heads=4)
+        ])
+        
+        # Final classifier
+        self.classifier = nn.Sequential(
+            nn.Linear(256, 256),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(256, num_classes)
+        )
+
+    def forward(self, x):
+        # Backbone features
+        features = self.backbone.features(x)
+        
+        # Channel reduction
+        features = self.channel_reduce(features)
+        
+        # Prepare for SVTR
+        B, C, H, W = features.shape
+        features = features.permute(0, 2, 3, 1).reshape(B, H*W, -1)
+        
+        # Process through SVTR neck
+        for block in self.svtr_neck:
+            features = block(features, H, W)
+        
+        # Classification
+        output = self.classifier(features)
+        return output.permute(1, 0, 2)  # (T, B, C) for CTC
+
+    def get_seq_length(self):
+        return self.feature_h * self.feature_w
+    
+
 def decode_predictions(outputs):
     # Greedy decoding
     _, max_indices = torch.max(outputs.softmax(2), 2)
@@ -175,7 +279,7 @@ def predict_single_image(model, image_path, device):
     """Tek bir görüntü için tahmin yapar"""
     # Görüntü önişleme
     transform = transforms.Compose([
-        transforms.Resize((64, 192)),
+        transforms.Resize((64, 320)), #192
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
@@ -216,7 +320,7 @@ def predict_single_image(model, image_path, device):
     
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model = load_model('best_plate_ocr_model.pth', device)
+model = load_model('best_plate_ocr_model_0.98_0.93.pth', device)
 image_path = r'E:\rec_derpet\rec_derpet\test\34FFS025.jpg'
 result = predict_single_image(model, image_path, device)
 print("\nSingle Image Prediction:")
@@ -228,8 +332,23 @@ for char, conf in result['char_confidences']:
 
 #Stress test
 from time import time 
-for i in range(50):
+from glob import glob 
+import os 
+import cv2 
+
+plate_data_path = r"E:\Downloads\archive\x-anylabeling-crops\license plate\*.jpg" 
+files = glob(os.path.join(plate_data_path))
+for i in files:
+    image_path = i
+    image = cv2.imread(i)
     f1 = time()
     result = predict_single_image(model, image_path, device)
+    print(f"Confidence: {result['confidence']:.4f}")
+    print(f"Predicted Plate: {result['prediction']}")
     f2 = time()
     print(f"Single Image Prediction: {f2-f1}")
+    cv2.imshow(f"{result['prediction']}", image)
+    ch = cv2.waitKey(0)
+    cv2.destroyAllWindows()
+    if ch == ord('q'):
+        break
